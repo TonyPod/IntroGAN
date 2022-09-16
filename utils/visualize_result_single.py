@@ -239,38 +239,6 @@ def vis_acc_and_fid(folder_path, dataset, nb_cl, test_interval=None, num_iters=N
                 fout.write(str(fid_auc))
 
 
-def vis_acc_mergan_like(folder_path, nb_cl, num_classes, dataset, num_iters):
-    aver_acc_arr = []
-    task_num_acc = 0
-
-    for num_seen_classes in range(nb_cl, num_classes + nb_cl, nb_cl):
-        subfolder = os.path.join(folder_path, 'class_1-%d' % num_seen_classes)
-
-        # check whether the task has been trained or not
-        acc_file = os.path.join(subfolder, 'mergan_like_acc.pkl')
-        if not os.path.exists(acc_file):
-            break
-
-        task_num_acc += 1
-
-        with open(acc_file, 'rb') as fin:
-            accs = pickle.load(fin)
-            aver_acc_arr.append(np.mean(accs))
-
-    plt.figure(figsize=(7.5, 6), dpi=150)
-    plt.title(dataset)
-
-    x = range(num_iters, num_iters * (task_num_acc + 1), num_iters)
-
-    plt.plot(x, aver_acc_arr, marker='.')
-
-    plt.margins(0)
-
-    output_name = os.path.join(folder_path, 'mergan_like_acc_curve.pdf')
-    plt.savefig(output_name)
-    plt.close()
-
-
 if __name__ == '__main__':
     # vis_acc_and_fid('../result/protogan/fashion-mnist_order_1/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/proto_static_20_weight_0.000100_squared_l2/dim_1024/finetune_improved', dataset='fashion-mnist', nb_cl=2)
     # vis_acc_and_fid('../result/protogan/fashion-mnist_order_1/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/proto_static_20_weight_0.000100_squared_l2/dim_1024/finetune', dataset='fashion-mnist', nb_cl=2)
@@ -281,6 +249,4 @@ if __name__ == '__main__':
     # vis_acc_and_fid('../result/protogan/fashion-mnist_order_3/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/proto_static_20_weight_0.000100_squared_l2/dim_1024/finetune_improved', dataset='fashion-mnist', nb_cl=2)
     # vis_acc_and_fid('../result/protogan/fashion-mnist_order_3/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/proto_static_20_weight_0.000100_squared_l2/dim_1024/finetune', dataset='fashion-mnist', nb_cl=2)
     # vis_acc_and_fid('../result/protogan/fashion-mnist_order_3/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/proto_static_20_weight_0.000100_squared_l2/dim_1024/from_scratch', dataset='fashion-mnist', nb_cl=2)
-    vis_acc_mergan_like(
-        '../result/iacgan/svhn_order_1/nb_cl_2/dcgan_critic_1_class_1_ac_1.0_0.1/0.0002_0.5_0.999/10000/finetune_improved',
-        2, 10, 'svhn', 10000)
+    pass

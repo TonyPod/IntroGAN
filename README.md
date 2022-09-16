@@ -24,11 +24,15 @@ For requirements for the Python modules, simply run:
 
 #### 2.1 MNIST
 
-
+Download ``train-images-idx3-ubyte.gz``, ``train-labels-idx1-ubyte.gz``, ``t10k-images-idx3-ubyte.gz``, ``t10k-labels-idx1-ubyte.gz`` from the official website of [MNIST](http://yann.lecun.com/exdb/mnist/) and move them to ``datasets/mnist``.
 
 #### 2.2 Fashion-MNIST
 
 Download ``train-images-idx3-ubyte.gz``, ``train-labels-idx1-ubyte.gz``, ``t10k-images-idx3-ubyte.gz``, ``t10k-labels-idx1-ubyte.gz`` from the official website of [Fashion-MNIST](https://github.com/zalandoresearch/fashion-mnist) and move them to ``datasets/fashion-mnist``.
+
+#### 2.3 SVHN
+
+Download ``train_32x32.mat``, ``test_32x32.mat`` from the official website of [SVHN](http://ufldl.stanford.edu/housenumbers/) and move them to ``datasets/svhn``.
 
 ### 3. Precomputed statistics for calculating FIDs
 
@@ -40,11 +44,34 @@ Download the files for different datasets below and extracted in the ``precalc_f
 
 **SVHN**: [[Google Drive]](https://drive.google.com/file/d/13naH1scHToqwcyvb9InaTeK705ejElID/view?usp=sharing)
 
-### 3. Training
+### 4. Training
 
-**MNIST**: ``python mnist_train_introgan.py``
+**MNIST**:
 
-**Fashion-MNIST**: ``python mnist_train_introgan.py --dataset mnist``
+_IntroGAN_: `python mnist_train_introgan.py --dataset mnist`
 
+_DGR_: `python mnist_train_dgr.py --dataset mnist`
 
-**SVHN**: ``python svhn_train_introgan.py``
+_MeRGAN_: `python mnist_train_mergan.py --dataset mnist`
+
+**Fashion-MNIST**: 
+
+_IntroGAN_: `python mnist_train_introgan.py`
+
+_DGR_: `python mnist_train_dgr.py`
+
+_MeRGAN_: `python mnist_train_mergan.py`
+
+**SVHN**: 
+
+_IntroGAN_: `python svhn_train_introgan.py`
+
+_DGR_: `python svhn_train_dgr.py`
+
+_MeRGAN_: `python svhn_train_mergan.py`
+
+**After running the code above, the TA-ACC and TA-FID of this particular run can be found in the result folder, e.g. `result/introgan/fashion-mnist_order_1/nb_cl_2/dcgan_critic_1_ac_1.0_0.1/0.0002_0.5_0.999/500/proto_static_random_20_weight_0.000000_0.000000_squared_l2_0.010000_min_select/finetune_improved_v2_noise_0.5_exemplars_dual_use_1`**
+
+## Further 
+
+If you have any question, feel free to contact me. My email is chen.he@vipl.ict.ac.cn

@@ -6,7 +6,6 @@ from collections import Counter
 
 import numpy as np
 import tensorflow as tf
-import tensorflow.contrib.slim as slim
 from PIL import Image
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
@@ -15,34 +14,24 @@ import gan.tflib as lib
 import gan.tflib.inception_score
 import gan.tflib.ops
 import gan.tflib.ops.batchnorm
+import gan.tflib.ops.cond_batchnorm
 import gan.tflib.ops.conv2d
 import gan.tflib.ops.deconv2d
+import gan.tflib.ops.layernorm
 import gan.tflib.ops.linear
 import gan.tflib.plot
 import gan.tflib.save_images
 from utils.fid import calculate_fid_given_paths_with_sess
 
 
-def leaky_relu(x, alpha=0.2):
-    return tf.maximum(alpha * x, x)
-
-
-def conv_cond_concat(x, y):
-    x_shapes = x.get_shape()
-    y_shapes = y.get_shape()
-    return tf.concat([x, y * tf.ones([x_shapes[0], y_shapes[1], x_shapes[2], x_shapes[3]])], 1)
-
-
-class LLGAN(object):
+class MeRGAN(object):
 
     def __init__(self, sess, graph, sess_fid, dataset, mode, batch_size, output_dim,
                  lambda_param, critic_iters, class_iters, iters, result_dir, checkpoint_interval,
-                 adam_lr, adam_beta1, adam_beta2, finetune, improved_finetune, nb_cl, nb_output, acgan_scale,
+                 adam_lr, adam_beta1, adam_beta2, finetune, improved_finetune, nb_cl, num_seen_classes, acgan_scale,
                  acgan_scale_g,
-                 classification_only, order_idx, order, test_interval, use_softmax, use_diversity_promoting,
-                 diversity_promoting_weight, improved_finetune_type, improved_finetune_noise,
-                 improved_finetune_noise_level,
-                 num_samples_per_class,
+                 classification_only, order_idx, order, test_interval, dim, num_classes, pre_aloc_class,
+                 improved_finetune_type, improved_finetune_noise, improved_finetune_noise_level, num_samples_per_class,
                  use_protos, protos_path, protos_num, protos_importance):
 
         self.sess = sess
@@ -76,17 +65,23 @@ class LLGAN(object):
         self.improved_finetune_noise_level = improved_finetune_noise_level
 
         self.nb_cl = nb_cl
-        self.nb_output = nb_output
+        self.num_classes = num_classes
+        self.num_seen_classes = num_seen_classes
+        self.pre_aloc_class = pre_aloc_class
+
+        if self.pre_aloc_class:
+            self.nb_output = num_classes  # dimension of the output layer (how many output nodes)
+        else:
+            self.nb_output = num_seen_classes
 
         self.order_idx = order_idx
         self.order = order
 
         self.classification_only = classification_only
 
-        self.use_diversity_promoting = use_diversity_promoting
-        self.diversity_promoting_weight = diversity_promoting_weight
+        self.dim = dim
 
-        self.is_first_session = (self.nb_output == self.nb_cl)
+        self.is_first_session = (self.num_seen_classes == self.nb_cl)
 
         self.test_interval = test_interval
 
@@ -96,8 +91,6 @@ class LLGAN(object):
         self.protos_importance = protos_importance
         self.protos_path = protos_path
         self.protos_num = protos_num
-
-        self.use_softmax = use_softmax
 
         self.build_model()
 
@@ -109,14 +102,14 @@ class LLGAN(object):
         lib.delete_all_params()
 
         with tf.variable_scope("gan") as scope, self.graph.as_default():
-            # placeholder for MNIST samples
+            # placeholder for SVHN 3x32x32 samples
             self.real_data_int = tf.placeholder(tf.int32, shape=[self.batch_size, self.output_dim])
-            self.real_y = tf.placeholder(tf.float32, shape=[None, self.nb_output])
+            self.real_y = tf.placeholder(tf.float32, shape=[self.batch_size, self.nb_output])
             self.gen_y = tf.placeholder(tf.float32, shape=[None, self.nb_output])
             self.sample_y = tf.placeholder(tf.float32, shape=[None, self.nb_output])
 
             real_data = 2 * ((tf.cast(self.real_data_int, tf.float32) / 255.) - .5)
-            fake_data, fake_labels, noise = self.generator(self.batch_size, self.gen_y)
+            fake_data, fake_labels = self.generator(self.batch_size, self.gen_y)
 
             # set_shape to facilitate concatenation of label and image
             fake_data.set_shape([self.batch_size, fake_data.shape[1].value])
@@ -129,25 +122,19 @@ class LLGAN(object):
             self.inputs_int = tf.placeholder(tf.int32, shape=[None, self.output_dim])
             inputs = 2 * ((tf.cast(self.inputs_int, tf.float32) / 255.) - .5)
             _, self.class_logits = self.discriminator(inputs, reuse=True, is_training=False)
-            self.pred_y = tf.argmax(self.class_logits, 1)
+            self.pred_y = tf.argmax(self.class_logits, axis=1)
 
             self.embeddings = self.embedding_func(inputs, reuse=True)
 
             self.real_accu = tf.reduce_mean(
-                tf.cast(tf.equal(tf.argmax(disc_real_class, 1), tf.argmax(self.real_y, 1)), dtype=tf.float32))
+                tf.cast(tf.equal(tf.argmax(disc_real_class, axis=1), tf.argmax(self.real_y, 1)), dtype=tf.float32))
             self.fake_accu = tf.reduce_mean(
-                tf.cast(tf.equal(tf.argmax(disc_fake_class, 1), tf.argmax(fake_labels, 1)), dtype=tf.float32))
+                tf.cast(tf.equal(tf.argmax(disc_fake_class, axis=1), tf.argmax(fake_labels, 1)), dtype=tf.float32))
 
-            if self.use_softmax:
-                self.real_class_cost = tf.reduce_mean(
-                    tf.nn.softmax_cross_entropy_with_logits(logits=disc_real_class, labels=self.real_y))
-                self.gen_class_cost = tf.reduce_mean(
-                    tf.nn.softmax_cross_entropy_with_logits(logits=disc_fake_class, labels=fake_labels))
-            else:
-                self.real_class_cost = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_real_class, labels=self.real_y))
-                self.gen_class_cost = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_fake_class, labels=fake_labels))
+            self.real_class_cost = tf.reduce_mean(
+                tf.nn.softmax_cross_entropy_with_logits(logits=disc_real_class, labels=self.real_y))
+            self.gen_class_cost = tf.reduce_mean(
+                tf.nn.softmax_cross_entropy_with_logits(logits=disc_fake_class, labels=fake_labels))
 
             self.class_cost = self.real_class_cost * self.acgan_scale
 
@@ -176,7 +163,7 @@ class LLGAN(object):
                 gradient_penalty = tf.reduce_mean((slopes - 1.) ** 2)
                 self.disc_cost += self.lambda_param * gradient_penalty
             elif self.mode == 'dcgan':
-                # DCGAN loss
+                # Vanilla / Non-saturating loss
                 self.gen_cost = tf.reduce_mean(
                     tf.nn.sigmoid_cross_entropy_with_logits(logits=disc_fake, labels=tf.ones_like(disc_fake)))
                 self.disc_cost = tf.reduce_mean(
@@ -186,16 +173,6 @@ class LLGAN(object):
                 self.disc_cost /= 2.
 
             self.gen_cost += self.acgan_scale_g * self.gen_class_cost
-
-            # diversity promoting
-            if self.use_diversity_promoting:
-                noise_split = tf.split(noise, 2)
-                gen_samples_split = tf.split(fake_data, 2)
-                self.diversity_cost = tf.reduce_mean(tf.abs(gen_samples_split[0] - gen_samples_split[1])) / \
-                                      tf.reduce_mean(tf.abs(noise_split[0] - noise_split[1]))
-                self.gen_cost -= self.diversity_promoting_weight * self.diversity_cost
-            else:
-                self.diversity_cost = tf.no_op()
 
             if self.classification_only:
                 self.gen_train_op = \
@@ -225,11 +202,11 @@ class LLGAN(object):
                         .minimize(self.class_cost, var_list=class_params)
 
             # For generating samples
-            fixed_noise_128 = tf.constant(np.random.normal(size=(128, 100)).astype('float32'))
+            fixed_noise_128 = tf.constant(np.random.normal(size=(128, 128)).astype('float32'))
             self.fixed_noise_samples_128 = self.sampler(128, self.sample_y, noise=fixed_noise_128)[0]
 
             # For calculating inception score
-            self.test_noise = tf.random_normal([self.batch_size, 100])
+            self.test_noise = tf.random_normal([self.batch_size, 128])
             self.test_samples = self.sampler(self.batch_size, self.sample_y, noise=self.test_noise)[0]
 
             var_list = tf.trainable_variables()
@@ -241,12 +218,12 @@ class LLGAN(object):
             self.saver = tf.train.Saver(var_list=var_list)  # var_list doesn't contain Adam params
 
             if self.finetune:
-                if self.improved_finetune:
-                    var_list_for_finetune = [var for var in var_list if
-                                             'g_Input.W' not in var.name and 'd_ClassOutput' not in var.name]
+                if self.pre_aloc_class:
+                    var_list_for_finetune = var_list
                 else:
                     var_list_for_finetune = [var for var in var_list if
-                                             'g_Input' not in var.name and 'd_ClassOutput' not in var.name]
+                                             not (
+                                                     'offset' in var.name or 'scale' in var.name) and 'd_ClassOutput' not in var.name]
                 self.saver_for_finetune = tf.train.Saver(var_list=var_list_for_finetune)
 
     def gen_labels(self, nb_samples, condition=None):
@@ -261,14 +238,14 @@ class LLGAN(object):
 
     def generate_image(self, frame, train_log_dir_for_cur_class):
         # different y, same x
-        for category_idx in range(self.nb_output):
+        for category_idx in range(self.num_seen_classes):
             y = self.gen_labels(128, category_idx)
             samples = self.sess.run(self.fixed_noise_samples_128, feed_dict={self.sample_y: y})
             samples = ((samples + 1.) * (255. / 2)).astype('int32')
             samples_folder = os.path.join(train_log_dir_for_cur_class, 'samples', 'class_%d' % (category_idx + 1))
             if not os.path.exists(samples_folder):
                 os.makedirs(samples_folder)
-            gan.tflib.save_images.save_images(samples.reshape((128, 1, 28, 28)),
+            gan.tflib.save_images.save_images(samples.reshape((128, 3, 32, 32)),
                                               os.path.join(samples_folder,
                                                            'samples_{}.jpg'.format(frame)))
             # dump samples for visualization etc.
@@ -283,7 +260,7 @@ class LLGAN(object):
 
         temp_folder = os.path.join(train_log_dir_for_cur_class, 'fid_temp')
 
-        for category_idx in range(self.nb_output):
+        for category_idx in range(self.num_seen_classes):
             sub_folder = os.path.join(temp_folder, 'class_%d' % (category_idx + 1))
             if not os.path.exists(sub_folder):
                 os.makedirs(sub_folder)
@@ -301,8 +278,7 @@ class LLGAN(object):
                 x.extend(x_batch)
             # print('Generation %d: %.2f seconds' % (category_idx + 1, time.time() - time_start))
             for i, x_single in enumerate(x):
-                img = Image.fromarray(
-                    np.repeat(x_single.astype('uint8').reshape((1, 28, 28)).transpose((1, 2, 0)), 3, axis=2))
+                img = Image.fromarray(x_single.astype('uint8').reshape((3, 32, 32)).transpose((1, 2, 0)))
                 img.save(os.path.join(sub_folder, '%d.jpg' % (i + 1)))
 
         for category_idx in range(self.nb_output):
@@ -336,42 +312,40 @@ class LLGAN(object):
         samples_int = ((samples + 1.) * (255. / 2)).astype('int32')
         return samples_int, samples, z
 
+    def leaky_relu(self, x, alpha=0.2):
+        return tf.maximum(alpha * x, x)
+
+    def Normalize(self, name, inputs, labels=None):
+        if labels is not None:
+            return lib.ops.cond_batchnorm.Cond_Batchnorm(name, [0, 2, 3], inputs, labels=labels,
+                                                         n_labels=self.nb_output)
+        else:
+            return lib.ops.batchnorm.Batchnorm(name, [0, 2, 3], inputs, fused=True)
+
     def generator(self, n_samples, y, noise=None):
 
         with tf.variable_scope('Generator') as scope:
-
             if noise is None:
-                noise = tf.random_normal([n_samples, 100])
+                noise = tf.random_normal([n_samples, 128])
 
-            # if self.nb_output > 1:
-            #     z = tf.concat([noise, y], axis=1)
-            # else:
-            #     z = noise
-            z = tf.concat([noise, y], axis=1)
-
-            output = gan.tflib.ops.linear.Linear('g_Input', z.shape[1].value, 4 * 4 * 4 * 64, z)
-
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn1', [0], output)
-            output = tf.nn.relu(output)
-            output = tf.reshape(output, [-1, 4 * 64, 4, 4])
-
-            output = lib.ops.deconv2d.Deconv2D('g_2', 4 * 64, 2 * 64, 5, output)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn2', [0, 2, 3], output)
+            output = lib.ops.linear.Linear('Generator.Input', 128, 4 * 4 * 4 * self.dim, noise)
+            output = tf.reshape(output, [-1, 4 * self.dim, 4, 4])
+            output = self.Normalize('Generator.BN1', output, labels=y)
             output = tf.nn.relu(output)
 
-            output = output[:, :, :7, :7]
-
-            output = lib.ops.deconv2d.Deconv2D('g_3', 2 * 64, 64, 5, output)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn3', [0, 2, 3], output)
+            output = lib.ops.deconv2d.Deconv2D('Generator.2', 4 * self.dim, 2 * self.dim, 5, output)
+            output = self.Normalize('Generator.BN2', output, labels=y)
             output = tf.nn.relu(output)
 
-            output = lib.ops.deconv2d.Deconv2D('g_5', 64, 1, 5, output)
+            output = lib.ops.deconv2d.Deconv2D('Generator.3', 2 * self.dim, self.dim, 5, output)
+            output = self.Normalize('Generator.BN3', output, labels=y)
+            output = tf.nn.relu(output)
+
+            output = lib.ops.deconv2d.Deconv2D('Generator.5', self.dim, 3, 5, output)
+
             output = tf.tanh(output)
 
-            return tf.reshape(output, [-1, self.output_dim]), y, noise
+            return tf.reshape(output, [-1, self.output_dim]), y
 
     def sampler(self, n_samples, y, noise=None):
 
@@ -379,61 +353,46 @@ class LLGAN(object):
             scope.reuse_variables()
 
             if noise is None:
-                noise = tf.random_normal([n_samples, 100])
+                noise = tf.random_normal([n_samples, 128])
 
-            # if self.nb_output > 1:
-            #     z = tf.concat([noise, y], axis=1)
-            # else:
-            #     z = noise
-            z = tf.concat([noise, y], axis=1)
-
-            output = gan.tflib.ops.linear.Linear('g_Input', z.shape[1].value, 4 * 4 * 4 * 64, z)
-
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn1', [0], output)
-            output = tf.nn.relu(output)
-            output = tf.reshape(output, [-1, 4 * 64, 4, 4])
-
-            output = lib.ops.deconv2d.Deconv2D('g_2', 4 * 64, 2 * 64, 5, output)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn2', [0, 2, 3], output)
+            output = lib.ops.linear.Linear('Generator.Input', 128, 4 * 4 * 4 * self.dim, noise)
+            output = tf.reshape(output, [-1, 4 * self.dim, 4, 4])
+            output = self.Normalize('Generator.BN1', output, labels=y)
             output = tf.nn.relu(output)
 
-            output = output[:, :, :7, :7]
-
-            output = lib.ops.deconv2d.Deconv2D('g_3', 2 * 64, 64, 5, output)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('g_bn3', [0, 2, 3], output)
+            output = lib.ops.deconv2d.Deconv2D('Generator.2', 4 * self.dim, 2 * self.dim, 5, output)
+            output = self.Normalize('Generator.BN2', output, labels=y)
             output = tf.nn.relu(output)
 
-            output = lib.ops.deconv2d.Deconv2D('g_5', 64, 1, 5, output)
+            output = lib.ops.deconv2d.Deconv2D('Generator.3', 2 * self.dim, self.dim, 5, output)
+            output = self.Normalize('Generator.BN3', output, labels=y)
+            output = tf.nn.relu(output)
+
+            output = lib.ops.deconv2d.Deconv2D('Generator.5', self.dim, 3, 5, output)
+
             output = tf.tanh(output)
 
             return tf.reshape(output, [-1, self.output_dim]), y
 
     def embedding_func(self, inputs, reuse):
+
         with tf.variable_scope('Discriminator') as scope:
             if reuse:
                 scope.reuse_variables()
 
-            output = tf.reshape(inputs, [-1, 1, 28, 28])
+            output = tf.reshape(inputs, [-1, 3, 32, 32])
 
-            output = lib.ops.conv2d.Conv2D('d_1', 1, 64, 5, output, stride=2)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.1', 3, self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = lib.ops.conv2d.Conv2D('d_2', 64, 2 * 64, 5, output, stride=2)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('d_bn2', [0, 2, 3], output)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.2', self.dim, 2 * self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = lib.ops.conv2d.Conv2D('d_3', 2 * 64, 4 * 64, 5, output, stride=2)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('d_bn3', [0, 2, 3], output)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.3', 2 * self.dim, 4 * self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = tf.reshape(output, [-1, 4 * 4 * 4 * 64])
+            output = tf.reshape(output, [-1, 4 * 4 * 4 * self.dim])
 
-            output = slim.flatten(output)
             return output
 
     def discriminator(self, inputs, reuse, is_training):
@@ -442,26 +401,21 @@ class LLGAN(object):
             if reuse:
                 scope.reuse_variables()
 
-            output = tf.reshape(inputs, [-1, 1, 28, 28])
+            output = tf.reshape(inputs, [-1, 3, 32, 32])
 
-            output = lib.ops.conv2d.Conv2D('d_1', 1, 64, 5, output, stride=2)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.1', 3, self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = lib.ops.conv2d.Conv2D('d_2', 64, 2 * 64, 5, output, stride=2)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('d_bn2', [0, 2, 3], output)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.2', self.dim, 2 * self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = lib.ops.conv2d.Conv2D('d_3', 2 * 64, 4 * 64, 5, output, stride=2)
-            if self.mode == 'wgan':
-                output = lib.ops.batchnorm.Batchnorm('d_bn3', [0, 2, 3], output)
-            output = leaky_relu(output)
+            output = lib.ops.conv2d.Conv2D('Discriminator.3', 2 * self.dim, 4 * self.dim, 5, output, stride=2)
+            output = self.leaky_relu(output)
 
-            output = tf.reshape(output, [-1, 4 * 4 * 4 * 64])
+            output = tf.reshape(output, [-1, 4 * 4 * 4 * self.dim])
 
-            output = slim.flatten(output)
-            sourceOutput = gan.tflib.ops.linear.Linear('d_SourceOutput', 4 * 4 * 4 * 64, 1, output)
-            classOutput = gan.tflib.ops.linear.Linear('d_ClassOutput', 4 * 4 * 4 * 64, self.nb_output, output)
+            sourceOutput = lib.ops.linear.Linear('d_SourceOutput', 4 * 4 * 4 * self.dim, 1, output)
+            classOutput = lib.ops.linear.Linear('d_ClassOutput', 4 * 4 * 4 * self.dim, self.nb_output, output)
 
             return tf.reshape(sourceOutput, shape=[-1]), tf.reshape(classOutput, shape=[-1, self.nb_output])
 
@@ -519,13 +473,12 @@ class LLGAN(object):
 
             with self.graph.as_default():
                 # Train loop
-                self.sess.run(
-                    tf.initialize_all_variables())  # saver's var_list contains 28 variables, tf.all_variables() contains more(plus Adam params)
+                self.sess.run(tf.initialize_all_variables())
                 if self.finetune and not self.is_first_session:
                     _, _, ckpt_path = self.load_finetune(category_idx - self.nb_cl)
 
-                    # special initialized for g_Input
-                    if self.improved_finetune:
+                    # special initialized for Input
+                    if self.improved_finetune and not self.pre_aloc_class:
                         # calc confusion matrix on the training set (only new classes): new classes -> old classes
                         pred_y = []
                         indices_new_classes = np.argmax(data_y, axis=1) >= category_idx - self.nb_cl + 1
@@ -541,42 +494,56 @@ class LLGAN(object):
                         # get the input tensor
                         ckpt_reader = tf.pywrap_tensorflow.NewCheckpointReader(ckpt_path)
                         input_tensor_names = [key for key in ckpt_reader.get_variable_to_shape_map().keys() if
-                                              'g_Input.W' in key or 'd_ClassOutput' in key]
-                        assert len(input_tensor_names) == 3
-                        g_Input_offset = 100
+                                              ('offset' in key or 'scale' in key)]
+                        assert len(input_tensor_names) == 6
 
-                        assert 'g_Input.W' in input_tensor_names[0]
+                        for input_tensor_name in input_tensor_names:
+                            input_tensor = ckpt_reader.get_tensor(input_tensor_name)
+
+                            for new_category_idx in range(category_idx - self.nb_cl + 1, category_idx + 1):
+                                most_confused_with = \
+                                    Counter(
+                                        pred_y[np.argmax(data_y_new_classes, axis=1) == new_category_idx]).most_common(
+                                        1)[0][0]
+                                tmp_tensor = np.expand_dims(input_tensor[most_confused_with], axis=0)
+                                if self.improved_finetune_noise:
+                                    if self.improved_finetune_type == 'v1':
+                                        noise_tensor = np.random.normal(0, (np.max(
+                                            tmp_tensor) - np.min(tmp_tensor)) / 6 * self.improved_finetune_noise_level,
+                                                                        tmp_tensor.shape)  # 3 sigma
+                                    elif self.improved_finetune_type == 'v2':
+                                        noise_tensor = np.random.normal(0, np.std(
+                                            tmp_tensor) * self.improved_finetune_noise_level,
+                                                                        tmp_tensor.shape)
+                                    else:
+                                        raise Exception()
+                                    tmp_tensor += noise_tensor
+                                input_tensor = np.concatenate((input_tensor, tmp_tensor))
+
+                            # assign value
+                            input_var_list = [var for var in tf.trainable_variables() if input_tensor_name in var.name]
+                            assert len(input_var_list) == 1
+                            self.sess.run(tf.assign(input_var_list[0], input_tensor))
+
+                        # the other 2 tensors
+                        input_tensor_names = [key for key in ckpt_reader.get_variable_to_shape_map().keys() if
+                                              'd_ClassOutput' in key]
+                        assert len(input_tensor_names) == 2
+
+                        assert 'd_ClassOutput.b' in input_tensor_names[0]
                         assert 'd_ClassOutput.W' in input_tensor_names[1]
-                        assert 'd_ClassOutput.b' in input_tensor_names[2]
 
-                        g_Input_W_name = input_tensor_names[0]
+                        d_ClassOutput_b_name = input_tensor_names[0]
                         d_ClassOutput_W_name = input_tensor_names[1]
-                        d_ClassOutput_b_name = input_tensor_names[2]
 
-                        g_Input_W = ckpt_reader.get_tensor(g_Input_W_name)
-                        d_ClassOutput_W = ckpt_reader.get_tensor(d_ClassOutput_W_name)
                         d_ClassOutput_b = ckpt_reader.get_tensor(d_ClassOutput_b_name)
+                        d_ClassOutput_W = ckpt_reader.get_tensor(d_ClassOutput_W_name)
 
                         for new_category_idx in range(category_idx - self.nb_cl + 1, category_idx + 1):
                             most_confused_with = \
                                 Counter(pred_y[np.argmax(data_y_new_classes, axis=1) == new_category_idx]).most_common(
                                     1)[
                                     0][0]
-
-                            tmp_tensor = np.expand_dims(g_Input_W[g_Input_offset + most_confused_with], axis=0)
-                            if self.improved_finetune_noise:
-                                if self.improved_finetune_type == 'v1':
-                                    noise_tensor = np.random.normal(0, (np.max(
-                                        tmp_tensor) - np.min(tmp_tensor)) / 6 * self.improved_finetune_noise_level,
-                                                                    tmp_tensor.shape)  # 3 sigma
-                                elif self.improved_finetune_type == 'v2':
-                                    noise_tensor = np.random.normal(0, np.std(
-                                        tmp_tensor) * self.improved_finetune_noise_level,
-                                                                    tmp_tensor.shape)
-                                else:
-                                    raise Exception()
-                                tmp_tensor += noise_tensor
-                            g_Input_W = np.concatenate((g_Input_W, tmp_tensor))
 
                             tmp_tensor = np.expand_dims(d_ClassOutput_W[:, most_confused_with], axis=1)
                             if self.improved_finetune_noise:
@@ -609,10 +576,6 @@ class LLGAN(object):
                             d_ClassOutput_b = np.append(d_ClassOutput_b, tmp_tensor)
 
                         # assign value
-                        input_var_list = [var for var in tf.trainable_variables() if g_Input_W_name in var.name]
-                        assert len(input_var_list) == 1
-                        self.sess.run(tf.assign(input_var_list[0], g_Input_W))
-
                         input_var_list = [var for var in tf.trainable_variables() if d_ClassOutput_W_name in var.name]
                         assert len(input_var_list) == 1
                         self.sess.run(tf.assign(input_var_list[0], d_ClassOutput_W))
@@ -661,8 +624,8 @@ class LLGAN(object):
                 start_time = time.time()
                 # Train generator
                 if iteration > pre_iters:
-                    _, _gen_cost, _gen_class_cost, _fake_accu, _diversity_cost = self.sess.run(
-                        [self.gen_train_op, self.gen_cost, self.gen_class_cost, self.fake_accu, self.diversity_cost],
+                    _, _gen_cost, _gen_class_cost, _fake_accu = self.sess.run(
+                        [self.gen_train_op, self.gen_cost, self.gen_class_cost, self.fake_accu],
                         feed_dict={self.gen_y: self.gen_labels(self.batch_size)})
 
                 for _ in range(self.critic_iters):
@@ -715,13 +678,6 @@ class LLGAN(object):
                                     .format(iteration + 1, _disc_cost, _class_cost, self.acgan_scale,
                                             time.time() - start_time))
 
-                if iteration == 0:
-                    self.generate_image(iteration, train_log_dir_for_cur_class)
-
-                # if (iteration + 1) < 500 and (iteration + 1) % 20 == 0:
-                if (iteration + 1) % 2000 == 0:
-                    self.generate_image(iteration + 1, train_log_dir_for_cur_class)
-
                 # Calculate dev loss and generate samples every 100 iters
                 if (iteration + 1) % self.test_interval == 0:
                     dev_disc_costs = []
@@ -732,17 +688,9 @@ class LLGAN(object):
                                                                                       self.batch_size)})
                         dev_disc_costs.append(_dev_disc_cost)
                     gan.tflib.plot.plot('dev disc cost', np.mean(dev_disc_costs))
+                    self.generate_image(iteration + 1, train_log_dir_for_cur_class)
 
-                    if self.dataset == 'fashion-mnist':
-                        test_X_num_per_class = 1000
-                        assert len(test_X) == (category_idx + 1) * test_X_num_per_class
-                        pred_logits = []
-                        for old_category_idx in range(category_idx + 1):
-                            pred_logits_batch = self.classify_for_logits(test_X[
-                                                                         test_X_num_per_class * old_category_idx: test_X_num_per_class * (
-                                                                                 old_category_idx + 1)])
-                            pred_logits.extend(pred_logits_batch)
-                    elif self.dataset == 'mnist':
+                    if self.dataset == 'svhn':
                         pred_logits = []
                         for pred_y_idx in range(0, len(test_X), 1000):
                             pred_logits_batch = self.classify_for_logits(test_X[pred_y_idx: pred_y_idx + 1000])
@@ -752,7 +700,7 @@ class LLGAN(object):
                     pred_logits = np.array(pred_logits)
                     pred_y = np.argmax(pred_logits, axis=1)
 
-                    # deprecated for MNIST
+                    # deprecated for svhn
                     # _test_accu = np.sum(pred_y == np.argmax(test_y, 1)) / float(len(test_X))
 
                     # confusion matrix and accuracy per class
@@ -768,7 +716,8 @@ class LLGAN(object):
                     history_conf_mat_dict['class_1-%d' % (category_idx + 1)][iteration + 1] = _test_conf_mat
 
                     # old task acc & new forgetting rate
-                    for old_task_class_num in range(self.nb_cl, category_idx + 1, self.nb_cl):
+                    for old_task_class_num in range(self.nb_cl, category_idx + (1 if self.nb_cl == 1 else 0),
+                                                    self.nb_cl):
                         test_indices_old_task = np.argmax(test_y, axis=1) < old_task_class_num
                         pred_y_old_task = np.argmax(pred_logits[test_indices_old_task, :old_task_class_num], axis=1)
                         test_y_old_task = test_y[test_indices_old_task]
@@ -783,7 +732,7 @@ class LLGAN(object):
                     self.save(iteration + 1, category_idx)
 
                 # Save logs every 100 iters
-                if (iteration + 1) % 1000 == 0:
+                if (iteration + 1) % 100 == 0:
                     gan.tflib.plot.flush(train_log_dir_for_cur_class)
 
                 gan.tflib.plot.tick()
@@ -791,15 +740,6 @@ class LLGAN(object):
             # final save checkpoint
             self.save(iteration + 1, category_idx, final=True)
 
-            cond_fid_file = os.path.join(train_log_dir_for_cur_class, 'cond_fid.pkl')
-            if not os.path.exists(cond_fid_file):
-                history_cond_fid = dict()
-                fid_vals = self.get_fid(train_log_dir_for_cur_class)
-                history_cond_fid[self.iters] = fid_vals
-
-                # save history cond fid
-                with open(cond_fid_file, 'wb') as fout:
-                    pickle.dump(history_cond_fid, fout)
             # save history conf mat
             for key in history_conf_mat_dict:
                 with open(os.path.join(train_log_dir_for_cur_class, '%s_conf_mat.pkl' % key), 'wb') as fout:
@@ -817,32 +757,30 @@ class LLGAN(object):
                 with open(cond_fid_file, 'wb') as fout:
                     pickle.dump(history_cond_fid, fout)
 
-        self.generate_image(self.iters + 1, train_log_dir_for_cur_class)
 
     @property
     def model_dir(self):
-        return LLGAN.model_dir_static(self)
+        return MeRGAN.model_dir_static(self)
 
     @staticmethod
     def model_dir_static(FLAGS):
         finetune_str = (('finetune_improved' + ('_v2' if FLAGS.improved_finetune_type == 'v2' else '') + (
-            '_noise_%.1f' % FLAGS.improved_finetune_noise_level if FLAGS.improved_finetune_noise else '')) if FLAGS.improved_finetune else 'finetune') if FLAGS.finetune else 'from_scratch'
+            '_noise_%.1f' % FLAGS.improved_finetune_noise_level if FLAGS.improved_finetune_noise else '')) if (
+                FLAGS.improved_finetune and not FLAGS.pre_aloc_class) else 'finetune') if FLAGS.finetune else 'from_scratch'
         finetune_str += (
             '_use_%d_protos_weight_%f' % (FLAGS.protos_num, FLAGS.protos_importance) if FLAGS.use_protos else '')
-        mode_str = FLAGS.mode + '_critic_%d_class_%d' % (FLAGS.critic_iters, FLAGS.class_iters) + (
-            '' if FLAGS.use_softmax else '_sigmoid')
+        mode_str = FLAGS.mode + '_critic_%d_class_%d' % (FLAGS.critic_iters, FLAGS.class_iters)
         mode_str += '_ac_%.1f_%.1f' % (FLAGS.acgan_scale, FLAGS.acgan_scale_g)
-        mode_str += '_diversity_promoting_%f' % FLAGS.diversity_promoting_weight if FLAGS.use_diversity_promoting else ''
         return os.path.join(FLAGS.result_dir, FLAGS.dataset + '_order_%d' % FLAGS.order_idx + (
             '_subset_%d' % FLAGS.num_samples_per_class if not FLAGS.num_samples_per_class == -1 else ''),
-                            'nb_cl_%d' % FLAGS.nb_cl, mode_str,
+                            ('nb_cl_%d' % FLAGS.nb_cl) + ('_pre_aloc_class' if FLAGS.pre_aloc_class else ''), mode_str,
                             str(FLAGS.adam_lr) + '_' + str(FLAGS.adam_beta1) + '_' + str(FLAGS.adam_beta2),
                             str(FLAGS.iters),
                             'classification_only_%s' % finetune_str if FLAGS.classification_only else finetune_str)
 
     @staticmethod
     def model_dir_for_class_static(FLAGS, category_idx):
-        return os.path.join(LLGAN.model_dir_static(FLAGS), 'class_%d-%d' % (1, category_idx + 1))
+        return os.path.join(MeRGAN.model_dir_static(FLAGS), 'class_%d-%d' % (1, category_idx + 1))
 
     def model_dir_for_class(self, category_idx):
         return os.path.join(self.model_dir, 'class_%d-%d' % (1, category_idx + 1))
@@ -924,9 +862,9 @@ class LLGAN(object):
         """
         print(" [*] Checking checkpoints for class %d" % (category_idx + 1))
         if step == -1:
-            checkpoint_dir = os.path.join(LLGAN.model_dir_for_class_static(FLAGS, category_idx), "checkpoints", "final")
+            checkpoint_dir = os.path.join(MeRGAN.model_dir_for_class_static(FLAGS, category_idx), "checkpoints", "final")
         else:
-            checkpoint_dir = os.path.join(LLGAN.model_dir_for_class_static(FLAGS, category_idx), "checkpoints",
+            checkpoint_dir = os.path.join(MeRGAN.model_dir_for_class_static(FLAGS, category_idx), "checkpoints",
                                           str(step))
 
         ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
